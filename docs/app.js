@@ -6,6 +6,7 @@ const statusText = document.querySelector("#status");
 const openButton = document.querySelector("#openButton");
 
 let destinationUrl = null;
+let objectUrl = null;
 
 function setStatus(kind, heading, message) {
   indicator.className = `spinner ${kind}`;
@@ -69,7 +70,7 @@ async function decryptLocki(encryptedValue, hexKey) {
 
 function dataUriToObjectUrl(dataUri) {
   const commaIndex = dataUri.indexOf(",");
-  if (commaIndex === -1 || !dataUri.startsWith("data:")) {
+  if (commaIndex === -1 || !/^data:/i.test(dataUri)) {
     throw new Error("Der entschlüsselte Inhalt ist keine gültige Data-URI.");
   }
 
@@ -77,19 +78,94 @@ function dataUriToObjectUrl(dataUri) {
   const data = dataUri.slice(commaIndex + 1);
   const parts = metadata.split(";");
   const mimeType = parts[0] || "application/octet-stream";
-  const isBase64 = parts.includes("base64");
+  const isBase64 = parts.some(part => part.toLowerCase() === "base64");
   const bytes = isBase64
     ? base64ToBytes(data.replace(/\s/g, ""))
-    : new TextEncoder().encode(decodeURIComponent(data));
+    : percentEncodedDataToBytes(data);
 
   return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
 }
 
+function percentEncodedDataToBytes(value) {
+  const bytes = [];
+
+  for (let index = 0; index < value.length;) {
+    if (value[index] === "%") {
+      const hex = value.slice(index + 1, index + 3);
+      if (!/^[0-9a-f]{2}$/i.test(hex)) {
+        throw new Error("Die Data-URI enthält eine ungültige Prozent-Kodierung.");
+      }
+
+      bytes.push(Number.parseInt(hex, 16));
+      index += 3;
+      continue;
+    }
+
+    const codePoint = value.codePointAt(index);
+    const character = String.fromCodePoint(codePoint);
+    bytes.push(...new TextEncoder().encode(character));
+    index += character.length;
+  }
+
+  return Uint8Array.from(bytes);
+}
+
+function normalizeWebUrl(value) {
+  let candidate = value;
+  const hasHttpScheme = /^https?:\/\//i.test(candidate);
+  const hasAnyScheme = /^[a-z][a-z0-9+.-]*:/i.test(candidate);
+  const looksLikeBareHost = /^(?:localhost|\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9-]+\.)+[a-z0-9-]+)(?::\d{1,5})?(?:[/?#]|$)/i.test(candidate);
+
+  if (candidate.startsWith("//")) {
+    candidate = `https:${candidate}`;
+  } else if (!hasHttpScheme && (looksLikeBareHost || !hasAnyScheme)) {
+    candidate = `https://${candidate}`;
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(candidate);
+  } catch {
+    throw new Error("Der entschlüsselte Inhalt ist keine gültige URL oder Data-URI.");
+  }
+
+  if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+    throw new Error(`Das URL-Protokoll „${parsedUrl.protocol}“ ist nicht erlaubt.`);
+  }
+
+  if (!parsedUrl.hostname) {
+    throw new Error("Die entschlüsselte URL enthält keinen gültigen Hostnamen.");
+  }
+
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error("URLs mit eingebetteten Zugangsdaten sind nicht erlaubt.");
+  }
+
+  return parsedUrl.href;
+}
+
+function resolveDestination(plaintext) {
+  const value = plaintext.trim();
+  if (!value) {
+    throw new Error("Der entschlüsselte Inhalt ist leer.");
+  }
+
+  if (/^data:/i.test(value)) {
+    objectUrl = dataUriToObjectUrl(value);
+    return objectUrl;
+  }
+
+  return normalizeWebUrl(value);
+}
+
 function tryOpenDestination() {
-  const newTab = window.open(destinationUrl, "_blank");
+  if (!destinationUrl) return;
+
+  const newTab = window.open("", "_blank");
 
   if (newTab) {
     newTab.opener = null;
+    newTab.location.replace(destinationUrl);
     setStatus("done", "Inhalt geöffnet", "Du kannst diesen Tab jetzt schließen.");
     openButton.hidden = true;
   } else {
@@ -121,7 +197,7 @@ async function start() {
     }
 
     const plaintext = await decryptLocki(entry.encrypted, entry.key);
-    destinationUrl = dataUriToObjectUrl(plaintext);
+    destinationUrl = resolveDestination(plaintext);
     tryOpenDestination();
   } catch (error) {
     console.error(error);
@@ -131,7 +207,7 @@ async function start() {
 
 openButton.addEventListener("click", tryOpenDestination);
 window.addEventListener("pagehide", () => {
-  if (destinationUrl) URL.revokeObjectURL(destinationUrl);
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
 });
 
 start();
